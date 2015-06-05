@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
-	MQTT "git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.golang.git"
+	"log"
 	"os"
 	"strconv"
 	"sync"
 	"time"
+
+	MQTT "git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.golang.git"
 )
 
 const BASE_TOPIC string = "/mqtt-bench/benchmark"
@@ -34,7 +37,7 @@ type ExecOptions struct {
 	IntervalTime      int    // メッセージ毎の実行間隔時間(ms)
 }
 
-func Execute(exec func(clients []*MQTT.Client, opts ExecOptions, param ...string) int, opts ExecOptions) {
+func Execute(exec func(clients []*MQTT.Client, opts ExecOptions, param ...string)(int, error) int, opts ExecOptions) error {
 	message := CreateFixedSizeMessage(opts.MessageSize)
 
 	// 配列を初期化
@@ -59,7 +62,7 @@ func Execute(exec func(clients []*MQTT.Client, opts ExecOptions, param ...string
 				Disconnect(client)
 			}
 		}
-		return
+		return errors.New("Connection Error")
 	}
 
 	// 安定させるために、一定時間待機する。
@@ -68,8 +71,11 @@ func Execute(exec func(clients []*MQTT.Client, opts ExecOptions, param ...string
 	fmt.Printf("%s Start benchmark\n", time.Now())
 
 	startTime := time.Now()
-	totalCount := exec(clients, opts, message)
+	totalCount, err := exec(clients, opts, message)
 	endTime := time.Now()
+	if err != nil {
+		return err
+	}
 
 	fmt.Printf("%s End benchmark\n", time.Now())
 
@@ -81,11 +87,12 @@ func Execute(exec func(clients []*MQTT.Client, opts ExecOptions, param ...string
 	throughput := float64(totalCount) / float64(duration) * 1000        // messages/sec
 	fmt.Printf("\nResult : broker=%s, clients=%d, totalCount=%d, duration=%dms, throughput=%.2fmessages/sec\n",
 		opts.Broker, opts.ClientNum, totalCount, duration, throughput)
+	return nil
 }
 
 // 全クライアントに対して、publishの処理を行う。
 // 送信したメッセージ数を返す（原則、クライアント数分となる）。
-func PublishAllClient(clients []*MQTT.Client, opts ExecOptions, param ...string) int {
+func PublishAllClient(clients []*MQTT.Client, opts ExecOptions, param ...string) (int, error)  {
 	message := param[0]
 
 	wg := new(sync.WaitGroup)
@@ -117,22 +124,23 @@ func PublishAllClient(clients []*MQTT.Client, opts ExecOptions, param ...string)
 
 	wg.Wait()
 
-	return totalCount
+	return totalCount, nil
 }
 
 // メッセージを送信する。
-func Publish(client *MQTT.Client, topic string, qos byte, retain bool, message string) {
+func Publish(client *MQTT.Client, topic string, qos byte, retain bool, message string) error {
 	token := client.Publish(topic, qos, retain, message)
 
 	if token.Wait() && token.Error() != nil {
-		fmt.Printf("Publish error: %s\n", token.Error())
+		return errors.New(fmt.Sprintf("Publish error: %s\n", token.Error()))
 	}
+	return nil
 }
 
 // 全クライアントに対して、subscribeの処理を行う。
 // 指定されたカウント数分、メッセージを受信待ちする（メッセージが取得できない場合はカウントされない）。
 // この処理では、Publishし続けながら、Subscribeの処理を行う。
-func SubscribeAllClient(clients []*MQTT.Client, opts ExecOptions, param ...string) int {
+func SubscribeAllClient(clients []*MQTT.Client, opts ExecOptions, param ...string) (int, error) {
 	wg := new(sync.WaitGroup)
 
 	results := make([]*SubscribeResult, len(clients))
@@ -184,7 +192,7 @@ func SubscribeAllClient(clients []*MQTT.Client, opts ExecOptions, param ...strin
 		totalCount += results[id].Count
 	}
 
-	return totalCount
+	return totalCount, nil
 }
 
 // Subscribeの処理結果
@@ -196,9 +204,12 @@ type SubscribeResult struct {
 func Subscribe(client *MQTT.Client, topic string, qos byte) *SubscribeResult {
 	var result *SubscribeResult = &SubscribeResult{}
 	result.Count = 0
+	lock = New(sync.Mutex)
 
 	var handler MQTT.MessageHandler = func(client *MQTT.Client, msg MQTT.Message) {
+		lock.Lock()
 		result.Count++
+		lock.Unlock()
 		if Debug {
 			fmt.Printf("Received message : topic=%s, message=%s\n", msg.Topic(), msg.Payload())
 		}
@@ -224,15 +235,19 @@ func CreateFixedSizeMessage(size int) string {
 	return message
 }
 
+// 複数プロセスで、ClientIDが重複すると、Broker側で問題となるため、
+// プロセスIDを利用して、IDを割り振る。
+// mqttbench<プロセスIDの16進数値>-<クライアントの連番>
+func generateClinentId() (id string) {
+	pid := strconv.FormatInt(int64(os.Getpid()), 16)
+	id := fmt.Sprintf("mqttbench%s-%d", pid, id)
+}
+
 // 指定されたBrokerへ接続し、そのMQTTクライアントを返す。
 // 接続に失敗した場合は nil を返す。
 func Connect(id int, execOpts ExecOptions) *MQTT.Client {
 
-	// 複数プロセスで、ClientIDが重複すると、Broker側で問題となるため、
-	// プロセスIDを利用して、IDを割り振る。
-	// mqttbench<プロセスIDの16進数値>-<クライアントの連番>
-	pid := strconv.FormatInt(int64(os.Getpid()), 16)
-	clientId := fmt.Sprintf("mqttbench%s-%d", pid, id)
+	clientId := generateClientId()
 
 	opts := MQTT.NewClientOptions()
 	opts.AddBroker(execOpts.Broker)
@@ -353,8 +368,12 @@ func main() {
 
 	switch method {
 	case "pub":
-		Execute(PublishAllClient, execOpts)
+		op = PublishAllClient
 	case "sub":
-		Execute(SubscribeAllClient, execOpts)
+		op = SubscribeAllClient 
+	}
+	err := Execute(op, execOpts)
+	if  err != nil {
+		log.Errorf("%s: failed %v", method, err)
 	}
 }
